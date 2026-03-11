@@ -23,7 +23,7 @@ A powerful, user-friendly desktop application for Optical Character Recognition 
 
 ### 2. Install Dependencies
 ```bash
-pip install paddleocr paddlepaddle pdf2image pillow openpyxl
+pip install paddlepaddle==3.2.0 paddleocr==3.3.3 pdf2image pillow openpyxl
 ```
 
 ## How to Use

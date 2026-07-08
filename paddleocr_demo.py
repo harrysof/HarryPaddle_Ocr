@@ -1,14 +1,15 @@
 """
 PaddleOCR Demo
 ──────────────
-Supports: images (JPG, PNG, BMP, TIFF) and scanned PDFs
+Supports: images (JPG, PNG, BMP, TIFF), scanned PDFs, and PDFs with an
+existing embedded text layer (auto-detected — see extract_pdf_text_layer).
 Languages: French (fr), Arabic (ar), English (en)
 
 On first run, PaddleOCR downloads the model (~100 MB).
 Subsequent runs use the cached model and are instant.
 
 Dependencies:
-    pip install paddleocr paddlepaddle pdf2image pillow openpyxl
+    pip install paddleocr paddlepaddle pdf2image pillow openpyxl pymupdf
     # For PDF support also install poppler:
     # Windows: https://github.com/oschwartz10612/poppler-windows/releases
     # Then add poppler/Library/bin to your PATH
@@ -19,7 +20,9 @@ import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+import difflib
 from typing import Dict, List, Tuple, Any, Optional
+from html.parser import HTMLParser
 
 
 # ─────────────────────────────────────────────
@@ -48,6 +51,13 @@ def import_pdf2image():
     try:
         from pdf2image import convert_from_path
         return convert_from_path
+    except ImportError:
+        return None
+
+def import_fitz():
+    try:
+        import fitz  # PyMuPDF
+        return fitz
     except ImportError:
         return None
 
@@ -156,6 +166,76 @@ def ocr_pdf(pdf_path: str, lang_code: str, log_fn) -> Dict[int, List[Tuple[str, 
     return results
 
 
+# ─────────────────────────────────────────────
+#  PDF TEXT-LAYER DETECTION (skip OCR when the PDF already has
+#  trustworthy embedded text — verified against an OCR sample, not
+#  just "does copiable text exist", since some invoicing software
+#  produces a text layer with broken accented-character mappings)
+# ─────────────────────────────────────────────
+
+MIN_TEXT_LAYER_CHARS = 50       # below this, treat as "no usable text layer"
+TEXT_LAYER_TRUST_THRESHOLD = 0.82  # similarity vs OCR probe needed to trust the text layer
+
+
+def extract_pdf_text_layer(pdf_path: str) -> Dict[int, List[Tuple[str, float, Any]]]:
+    """Extracts text directly from a PDF's embedded text layer via PyMuPDF —
+    no rasterization, no OCR. Returns the same {page: [(text, confidence, bbox), ...]}
+    shape as ocr_pdf/ocr_image, with confidence fixed at 100.0 since it's a
+    direct read, not a model prediction."""
+    fitz = import_fitz()
+    if fitz is None:
+        return {}
+    results: Dict[int, List[Tuple[str, float, Any]]] = {}
+    try:
+        doc = fitz.open(pdf_path)
+        for i, page in enumerate(doc, 1):
+            lines = []
+            d = page.get_text("dict")
+            for block in d.get('blocks', []):
+                for line in block.get('lines', []):
+                    text = "".join(span.get('text', '') for span in line.get('spans', [])).strip()
+                    if text:
+                        lines.append((text, 100.0, line.get('bbox')))
+            results[i] = lines
+        doc.close()
+    except Exception:
+        return {}
+    return results
+
+
+def ocr_pdf_page(pdf_path: str, lang_code: str, page_num: int) -> List[Tuple[str, float, Any]]:
+    """OCRs a single PDF page (used as a quick probe to sanity-check the text layer)."""
+    convert_from_path = import_pdf2image()
+    if convert_from_path is None:
+        return []
+    try:
+        pages = convert_from_path(pdf_path, dpi=200, first_page=page_num, last_page=page_num)
+    except Exception:
+        return []
+    if not pages:
+        return []
+    tmp = pdf_path + f"_probe_page{page_num}.png"
+    pages[0].save(tmp)
+    try:
+        return ocr_image(tmp, lang_code)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def text_layer_trust_score(layer_text: str, probe_text: str) -> float:
+    """Similarity (0-1) between the PDF's embedded text on page 1 and a quick
+    OCR pass on the same page. Used to catch text layers that exist but are
+    corrupted (e.g. broken font encoding dropping accented characters).
+    Not perfect — the OCR probe itself isn't 100% accurate either — so treat
+    TEXT_LAYER_TRUST_THRESHOLD as a tunable heuristic, not ground truth."""
+    a = layer_text.lower().strip()
+    b = probe_text.lower().strip()
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
 def format_results_text(lines: List[Tuple[str, float, Any]], show_confidence: bool=True) -> str:
     if not lines:
         return "(no text detected)"
@@ -166,6 +246,188 @@ def format_results_text(lines: List[Tuple[str, float, Any]], show_confidence: bo
         else:
             parts.append(text)
     return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────
+#  MARKDOWN EXPORT (built from PPStructure layout regions)
+# ─────────────────────────────────────────────
+
+class _MDTableParser(HTMLParser):
+    """Parses a PPStructure table HTML string into rows, tracking which rows
+    contained <th> cells so we know which row to use as the header."""
+    def __init__(self):
+        super().__init__()
+        self.rows: List[List[str]] = []
+        self.header_flags: List[bool] = []
+        self._current_row: List[str] = []
+        self._row_has_th = False
+        self._in_cell = False
+        self._cell_data = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('td', 'th'):
+            self._in_cell = True
+            self._cell_data = ""
+            if tag == 'th':
+                self._row_has_th = True
+        elif tag == 'tr':
+            self._current_row = []
+            self._row_has_th = False
+
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th'):
+            self._in_cell = False
+            self._current_row.append(self._cell_data.strip())
+        elif tag == 'tr':
+            if self._current_row:
+                self.rows.append(self._current_row)
+                self.header_flags.append(self._row_has_th)
+            self._current_row = []
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._cell_data += data
+
+
+def _md_escape_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", "<br>").strip()
+
+
+def html_table_to_markdown(html_str: str) -> str:
+    """Converts a PPStructure table HTML string into a GFM markdown table.
+
+    Known limitation: this does not merge rowspan/colspan cells, so tables
+    with merged cells will show repeated or empty cells instead of a true
+    merge. Fine for simple/regular tables; complex merged tables may need
+    a manual pass.
+    """
+    if not html_str:
+        return ""
+    parser = _MDTableParser()
+    parser.feed(html_str)
+    rows = parser.rows
+    if not rows:
+        return ""
+
+    n_cols = max(len(r) for r in rows)
+
+    def pad(row):
+        return row + [""] * (n_cols - len(row))
+
+    header_idx = next((i for i, f in enumerate(parser.header_flags) if f), 0)
+    header = pad(rows[header_idx])
+    body = [pad(r) for i, r in enumerate(rows) if i != header_idx]
+
+    lines = ["| " + " | ".join(_md_escape_cell(c) for c in header) + " |",
+             "| " + " | ".join(["---"] * n_cols) + " |"]
+    for r in body:
+        lines.append("| " + " | ".join(_md_escape_cell(c) for c in r) + " |")
+    return "\n".join(lines)
+
+
+def _region_lines(res: Any) -> List[str]:
+    """Extracts a flat list of text lines from a PPStructure region's `res` field."""
+    lines = []
+    if isinstance(res, list):
+        for item in res:
+            if isinstance(item, dict) and 'text' in item and str(item['text']).strip():
+                lines.append(str(item['text']).strip())
+    elif isinstance(res, dict) and 'text' in res:
+        text = str(res['text']).strip()
+        if text:
+            lines.append(text)
+    elif isinstance(res, str) and res.strip():
+        lines.append(res.strip())
+    return lines
+
+
+def _region_line_height(region: Dict) -> Optional[float]:
+    """Rough proxy for font size: region bbox height / its line count.
+    Used only to compare relative sizes within the same document, not as
+    an absolute measurement."""
+    bbox = region.get('bbox')
+    lines = _region_lines(region.get('res', {}))
+    if not bbox or len(bbox) != 4 or not lines:
+        return None
+    height = bbox[3] - bbox[1]
+    if height <= 0:
+        return None
+    return height / len(lines)
+
+
+def _region_sort_key(region: Dict) -> Tuple[float, float]:
+    bbox = region.get('bbox') or [0, 0, 0, 0]
+    return (bbox[1], bbox[0])  # top-to-bottom, then left-to-right
+
+
+def build_markdown_document(results: Dict[int, List[Dict]]) -> str:
+    """Builds a structured Markdown document from PPStructure layout results.
+
+    Heading detection is heuristic, not exact: a text region is promoted to
+    a heading if it's short (<=2 lines, <=12 words) AND its estimated line
+    height is noticeably taller than the document's median body-text line
+    height, or if PPStructure already tagged the region as 'title'.
+    Thresholds (1.3x / 1.8x median) are conservative starting points —
+    tune them if headings are over/under-triggering on your documents.
+    """
+    samples = []
+    for page_regions in results.values():
+        for region in page_regions:
+            if region.get('type') not in ('table', 'figure'):
+                h = _region_line_height(region)
+                if h:
+                    samples.append(h)
+    baseline = sorted(samples)[len(samples) // 2] if samples else None  # median
+
+    page_blocks = []
+    for page_num in sorted(results.keys()):
+        regions = sorted(results[page_num], key=_region_sort_key)
+        blocks = []
+        for region in regions:
+            r_type = region.get('type', 'text')
+            res = region.get('res', {})
+
+            if r_type == 'table':
+                html_str = res.get('html', '') if isinstance(res, dict) else (res if isinstance(res, str) else '')
+                md_table = html_table_to_markdown(html_str)
+                if md_table:
+                    blocks.append(md_table)
+                continue
+
+            if r_type == 'figure':
+                blocks.append("*(figure/image — not extracted)*")
+                continue
+
+            lines = _region_lines(res)
+            if not lines:
+                continue
+
+            if r_type == 'list':
+                blocks.append("\n".join(f"- {ln}" for ln in lines))
+                continue
+
+            text = " ".join(lines)
+            word_count = len(text.split())
+            line_height = _region_line_height(region)
+
+            is_heading = False
+            level = 3
+            if r_type == 'title':
+                is_heading, level = True, 2
+            if baseline and line_height and len(lines) <= 2 and word_count <= 12:
+                ratio = line_height / baseline
+                if ratio >= 1.8:
+                    is_heading, level = True, 1
+                elif ratio >= 1.3:
+                    is_heading, level = True, 2
+
+            blocks.append(f"{'#' * level} {text}" if is_heading else text)
+
+        page_blocks.append("\n\n".join(blocks))
+
+    if len(page_blocks) > 1:
+        return "\n\n<!-- page break -->\n\n".join(page_blocks)
+    return page_blocks[0] if page_blocks else ""
 
 
 # ─────────────────────────────────────────────
@@ -226,9 +488,10 @@ class PaddleOCRDemo:
             ("📁  Batch Folder", self._batch_folder, "#2E75B6"),
             ("▶  Run OCR",      self._run_ocr,      "#375623"),
             ("🗂  Extract Tables",self._extract_tables,"#7B2D8E"),
+            ("📝  Export Markdown", self._export_markdown, "#B45309"),
             ("💾  Save Text",   self._save_text,    "#595959"),
         ]:
-            if "Batch" in label or "Extract" in label:
+            if "Batch" in label or "Extract" in label or "Export" in label:
                  tk.Button(btn, text=label, command=cmd, width=16,
                       bg=color, fg="white",
                       font=("Arial", 10, "bold")).pack(side='left', padx=(12, 4))
@@ -311,7 +574,7 @@ class PaddleOCRDemo:
 
     def _open_pdf(self):
         path = filedialog.askopenfilename(
-            title="Select scanned PDF",
+            title="Select PDF",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
         )
         if not path:
@@ -323,10 +586,87 @@ class PaddleOCRDemo:
         self.preview_mode = 'ocr'
         self.file_label.config(text=f"File: {path}")
         self.preview_label.config(image='', text="PDF loaded\n(preview not available\nbefore extraction)")
-        self._set_text("PDF loaded. Click ▶ Run OCR or 🗂 Extract Tables.\n\n"
-                       "Note: requires Poppler installed and in PATH.")
-        self.status_var.set(f"Loaded: {os.path.basename(path)}")
+        self._set_text("PDF loaded. Checking for an embedded text layer...")
+        self.status_var.set(f"Loaded: {os.path.basename(path)} — checking text layer...")
         self._update_page_nav()
+        self._auto_detect_text_layer()
+
+    def _auto_detect_text_layer(self):
+        """On PDF load: try the embedded text layer first, verify it against a
+        quick OCR probe of page 1, and only fall back to full OCR if the text
+        layer is missing or looks unreliable. Saves OCR time on born-digital
+        or already-OCR'd PDFs; protects against PDFs whose embedded text is
+        present but corrupted (broken font encoding)."""
+        self.progress.configure(mode='indeterminate')
+        self.progress.pack(fill='x', padx=8, side='bottom', before=self.root.winfo_children()[-1])
+        self.progress.start(12)
+        self.root.update()
+
+        def worker():
+            if self.current_file is None:
+                return
+            layer_results = extract_pdf_text_layer(self.current_file)
+            total_chars = sum(len(t) for lines in layer_results.values() for t, _, _ in lines)
+
+            if total_chars < MIN_TEXT_LAYER_CHARS:
+                # No usable embedded text — clearly needs OCR, skip the probe
+                self.root.after(0, lambda: self._on_text_layer_check_done(layer_results, None))
+                return
+
+            self._log("Text layer found — verifying against a quick OCR sample...")
+            lang_code = LANG_MAP[self.lang_var.get()]
+            try:
+                probe_lines = ocr_pdf_page(self.current_file, lang_code, page_num=1)
+            except Exception:
+                probe_lines = []
+
+            self.root.after(0, lambda: self._on_text_layer_check_done(layer_results, probe_lines))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_text_layer_check_done(self, layer_results: Dict[int, List[Tuple]], probe_lines: Optional[List[Tuple]]):
+        self.progress.stop()
+        self.progress.pack_forget()
+
+        if not layer_results or not any(layer_results.values()):
+            self._set_text("No embedded text layer detected — this looks like a scanned PDF.\n\nClick ▶ Run OCR.")
+            self.status_var.set("No text layer found — ready for OCR.")
+            return
+
+        if not probe_lines:
+            # Couldn't run a probe (e.g. pdf2image/Poppler missing) — use the
+            # text layer but flag that it wasn't verified.
+            self.ocr_results = layer_results
+            self.current_page = 1
+            self._refresh_text()
+            self._update_page_nav()
+            self.status_var.set(
+                "Text layer loaded directly (unverified — could not run the OCR sanity check). "
+                "Click ▶ Run OCR to force real OCR instead."
+            )
+            return
+
+        probe_text = " ".join(t for t, _, _ in probe_lines)
+        layer_page1_text = " ".join(t for t, _, _ in layer_results.get(1, []))
+        score = text_layer_trust_score(layer_page1_text, probe_text)
+
+        if score >= TEXT_LAYER_TRUST_THRESHOLD:
+            self.ocr_results = layer_results
+            self.current_page = 1
+            self._refresh_text()
+            self._update_page_nav()
+            self.status_var.set(
+                f"Text layer used directly (match {score*100:.0f}% vs OCR sample) — no OCR needed. "
+                "Click ▶ Run OCR to force it anyway."
+            )
+        else:
+            self.status_var.set(f"Text layer looks unreliable (match {score*100:.0f}% vs OCR sample) — running full OCR...")
+            self._set_text(
+                f"Embedded text layer looks corrupted (only {score*100:.0f}% match against a quick "
+                "OCR check on page 1) — likely a font-encoding issue in the source PDF.\n\n"
+                "Falling back to full OCR..."
+            )
+            self._run_ocr()
 
     # ── OCR ────────────────────────────────────────────────────
 
@@ -692,6 +1032,35 @@ class PaddleOCRDemo:
             
         except Exception as e:
              messagebox.showerror("Export Error", f"Failed to export tables to Excel:\n{e}")
+
+    def _export_markdown(self):
+        if not self.table_results:
+            messagebox.showwarning(
+                "No layout data",
+                "Run 🗂 Extract Tables first — Markdown export uses the layout "
+                "regions it detects (tables, titles, text blocks), not the "
+                "plain ▶ Run OCR results."
+            )
+            return
+
+        default = os.path.splitext(os.path.basename(self.current_file))[0] + ".md"
+        out_path = filedialog.asksaveasfilename(
+            title="Save Markdown",
+            defaultextension=".md",
+            filetypes=[("Markdown files", "*.md"), ("All files", "*.*")],
+            initialfile=default
+        )
+        if not out_path:
+            return
+
+        try:
+            md = build_markdown_document(self.table_results)
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(md)
+            self.status_var.set(f"Saved: {out_path}")
+            messagebox.showinfo("Saved", f"Markdown saved to:\n{out_path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export Markdown:\n{e}")
 
     def _refresh_table_text(self):
         if not self.table_results:
